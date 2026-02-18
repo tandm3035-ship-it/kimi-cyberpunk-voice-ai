@@ -130,7 +130,7 @@ export class VoicePipeline {
     if (!this.isRunning) return;
     console.log("[KIMI STT] Connecting...");
 
-    const url = `wss://api.deepgram.com/v1/listen?model=nova-2&language=en&smart_format=true&interim_results=true&utterance_end_ms=1200&vad_events=true&endpointing=300&encoding=linear16&sample_rate=16000&channels=1`;
+    const url = `wss://api.deepgram.com/v1/listen?model=nova-2&language=en&smart_format=true&interim_results=true&utterance_end_ms=2000&vad_events=true&endpointing=800&encoding=linear16&sample_rate=16000&channels=1`;
 
     this.socket = new WebSocket(url, ["token", DEEPGRAM_KEY]);
 
@@ -176,12 +176,12 @@ export class VoicePipeline {
                 this.pendingFinals = [];
                 if (fullText) this.handleUserUtterance(fullText);
               }
-            }, 700);
+            }, 1200);
           } else {
             this.callbacks.onInterimTranscript(text);
 
-            // Interrupt on interim speech too
-            if (this.currentAudio && text.length > 3) {
+            // Interrupt on interim speech too (only on substantial speech)
+            if (this.currentAudio && text.split(" ").length >= 3) {
               console.log("[KIMI] Interrupting TTS (interim)");
               this.interruptTTS();
             }
