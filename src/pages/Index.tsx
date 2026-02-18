@@ -2,24 +2,28 @@ import { useState, useCallback, useRef } from "react";
 import { VoicePipeline, PipelineState, TranscriptEntry } from "@/lib/voice-pipeline";
 import VoiceOrb from "@/components/VoiceOrb";
 import Transcript from "@/components/Transcript";
-import { Mic, MicOff } from "lucide-react";
+import Waveform from "@/components/Waveform";
+import { Mic, MicOff, PhoneOff } from "lucide-react";
 
 const Index = () => {
   const [state, setState] = useState<PipelineState>("idle");
   const [audioLevel, setAudioLevel] = useState(0);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [interimText, setInterimText] = useState("");
+  const [waveformData, setWaveformData] = useState<number[]>([]);
   const [error, setError] = useState("");
   const pipelineRef = useRef<VoicePipeline | null>(null);
 
   const handleStart = useCallback(() => {
     setError("");
+    setTranscript([]);
     const pipeline = new VoicePipeline({
       onStateChange: setState,
       onInterimTranscript: setInterimText,
       onFinalTranscript: (entry) => setTranscript((prev) => [...prev, entry]),
       onError: (err) => setError(err),
       onAudioLevel: setAudioLevel,
+      onWaveformData: setWaveformData,
     });
     pipelineRef.current = pipeline;
     pipeline.start();
@@ -45,43 +49,43 @@ const Index = () => {
       </div>
 
       {/* Voice Orb */}
-      <div className="mb-16">
+      <div className="mb-8">
         <VoiceOrb state={state} audioLevel={audioLevel} />
       </div>
 
+      {/* Live Waveform */}
+      {isActive && (
+        <div className="mb-8 w-80">
+          <Waveform data={waveformData} state={state} />
+        </div>
+      )}
+
       {/* Start/Stop Button */}
-      <button
-        onClick={isActive ? handleStop : handleStart}
-        className={`
-          relative z-10 flex items-center gap-3 rounded-full px-12 py-5 font-display text-lg font-bold tracking-[0.15em] uppercase
-          transition-all duration-300
-          ${
-            isActive
-              ? "bg-destructive/20 border-2 border-destructive text-destructive hover:bg-destructive/30"
-              : "bg-primary/20 border-2 border-primary text-primary hover:bg-primary/30 neon-border"
-          }
-        `}
-        style={
-          !isActive
-            ? {
-                boxShadow:
-                  "0 0 15px hsl(120 100% 50% / 0.4), 0 0 30px hsl(120 100% 50% / 0.2), 0 0 60px hsl(120 100% 50% / 0.1)",
-              }
-            : undefined
-        }
-      >
-        {isActive ? (
-          <>
-            <MicOff className="h-6 w-6" />
-            END CALL
-          </>
-        ) : (
-          <>
-            <Mic className="h-6 w-6" />
-            START CALL
-          </>
-        )}
-      </button>
+      {!isActive ? (
+        <button
+          onClick={handleStart}
+          className="relative z-10 flex items-center gap-3 rounded-full px-14 py-6 font-display text-xl font-bold tracking-[0.15em] uppercase bg-primary/20 border-2 border-primary text-primary hover:bg-primary/30 neon-border transition-all duration-300"
+          style={{
+            boxShadow:
+              "0 0 20px hsl(120 100% 50% / 0.5), 0 0 40px hsl(120 100% 50% / 0.3), 0 0 80px hsl(120 100% 50% / 0.15)",
+          }}
+        >
+          <Mic className="h-7 w-7" />
+          START CALL
+        </button>
+      ) : (
+        <button
+          onClick={handleStop}
+          className="relative z-10 flex items-center gap-3 rounded-full px-14 py-6 font-display text-xl font-bold tracking-[0.15em] uppercase bg-destructive/30 border-4 border-destructive text-destructive hover:bg-destructive/50 transition-all duration-200 animate-pulse"
+          style={{
+            boxShadow:
+              "0 0 25px hsl(0 80% 50% / 0.6), 0 0 50px hsl(0 80% 50% / 0.3), 0 0 100px hsl(0 80% 50% / 0.15)",
+          }}
+        >
+          <PhoneOff className="h-7 w-7" />
+          END CALL
+        </button>
+      )}
 
       {/* Error display */}
       {error && (
