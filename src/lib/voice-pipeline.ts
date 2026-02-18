@@ -1,4 +1,5 @@
 // Voice pipeline: Deepgram STT (WebSocket) → Fireworks LLM → Deepgram TTS
+// Rebuilt for phone-call speed with interruption support
 
 const DEEPGRAM_KEY = "3509fd08965bd3e0d97585827ab5291c15f75364";
 const FIREWORKS_KEY = "fw_Uvswjw47Hd39egTHkMEqwV";
@@ -18,18 +19,26 @@ interface PipelineCallbacks {
   onFinalTranscript: (entry: TranscriptEntry) => void;
   onError: (error: string) => void;
   onAudioLevel: (level: number) => void;
+  onWaveformData: (data: number[]) => void;
 }
 
 export class VoicePipeline {
   private mediaStream: MediaStream | null = null;
-  private mediaRecorder: MediaRecorder | null = null;
-  private socket: WebSocket | null = null;
   private audioContext: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
+  private scriptProcessor: ScriptProcessorNode | null = null;
+  private sourceNode: MediaStreamAudioSourceNode | null = null;
   private animationFrame: number | null = null;
+  private socket: WebSocket | null = null;
   private conversationHistory: { role: string; content: string }[] = [];
   private callbacks: PipelineCallbacks;
   private isRunning = false;
+  private currentAudio: HTMLAudioElement | null = null;
+  private pendingFinals: string[] = [];
+  private utteranceTimer: ReturnType<typeof setTimeout> | null = null;
+  private keepAliveInterval: ReturnType<typeof setInterval> | null = null;
+  private isProcessing = false;
+  private sttReconnecting = false;
 
   constructor(callbacks: PipelineCallbacks) {
     this.callbacks = callbacks;
@@ -37,7 +46,7 @@ export class VoicePipeline {
       {
         role: "system",
         content:
-          "You are KIMI, a cutting-edge AI voice assistant. You are concise, helpful, and speak naturally. Keep responses short (1-3 sentences) since this is a voice conversation. Be warm but efficient.",
+          "You are KIMI, a cutting-edge AI voice assistant. Be extremely concise—respond in ONE short sentence max. Speak naturally like a phone call. Be warm but ultra-brief.",
       },
     ];
   }
@@ -47,56 +56,95 @@ export class VoicePipeline {
     this.isRunning = true;
 
     try {
-      // Get microphone
       this.mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
+          autoGainControl: true,
           sampleRate: 16000,
         },
       });
 
-      // Set up audio level monitoring
-      this.audioContext = new AudioContext();
-      const source = this.audioContext.createMediaStreamSource(this.mediaStream);
+      this.audioContext = new AudioContext({ sampleRate: 16000 });
+      this.sourceNode = this.audioContext.createMediaStreamSource(this.mediaStream);
+
+      // Analyser for visual waveform
       this.analyser = this.audioContext.createAnalyser();
       this.analyser.fftSize = 256;
-      source.connect(this.analyser);
-      this.monitorAudioLevel();
+      this.sourceNode.connect(this.analyser);
+      this.monitorAudio();
 
-      // Connect to Deepgram STT WebSocket
+      // ScriptProcessor to get raw PCM and send to Deepgram
+      this.scriptProcessor = this.audioContext.createScriptProcessor(4096, 1, 1);
+      this.sourceNode.connect(this.scriptProcessor);
+      this.scriptProcessor.connect(this.audioContext.destination);
+
+      this.scriptProcessor.onaudioprocess = (e) => {
+        if (!this.isRunning || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+        const float32 = e.inputBuffer.getChannelData(0);
+        // Convert float32 to int16 PCM
+        const int16 = new Int16Array(float32.length);
+        for (let i = 0; i < float32.length; i++) {
+          const s = Math.max(-1, Math.min(1, float32[i]));
+          int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        this.socket.send(int16.buffer);
+      };
+
       this.connectSTT();
     } catch (err: any) {
       console.error("[KIMI] Mic error:", err);
-      this.callbacks.onError("Microphone access denied. Please allow mic access.");
+      this.callbacks.onError("Microphone access denied.");
       this.stop();
     }
   }
 
-  private monitorAudioLevel() {
+  private monitorAudio() {
     if (!this.analyser) return;
-    const data = new Uint8Array(this.analyser.frequencyBinCount);
+    const freqData = new Uint8Array(this.analyser.frequencyBinCount);
+    const timeData = new Uint8Array(this.analyser.fftSize);
+
     const tick = () => {
       if (!this.analyser || !this.isRunning) return;
-      this.analyser.getByteFrequencyData(data);
-      const avg = data.reduce((a, b) => a + b, 0) / data.length;
+
+      // Frequency data for level
+      this.analyser.getByteFrequencyData(freqData);
+      const avg = freqData.reduce((a, b) => a + b, 0) / freqData.length;
       this.callbacks.onAudioLevel(avg / 255);
+
+      // Time-domain data for waveform
+      this.analyser.getByteTimeDomainData(timeData);
+      const waveform: number[] = [];
+      const step = Math.floor(timeData.length / 64);
+      for (let i = 0; i < 64; i++) {
+        waveform.push((timeData[i * step] - 128) / 128);
+      }
+      this.callbacks.onWaveformData(waveform);
+
       this.animationFrame = requestAnimationFrame(tick);
     };
     tick();
   }
 
   private connectSTT() {
-    console.log("[KIMI STT] Connecting to Deepgram...");
+    if (!this.isRunning) return;
+    console.log("[KIMI STT] Connecting...");
 
-    const url = `wss://api.deepgram.com/v1/listen?model=nova-2&language=en&smart_format=true&interim_results=true&utterance_end_ms=1500&vad_events=true&endpointing=300`;
+    const url = `wss://api.deepgram.com/v1/listen?model=nova-2&language=en&smart_format=true&interim_results=true&utterance_end_ms=1200&vad_events=true&endpointing=300&encoding=linear16&sample_rate=16000&channels=1`;
 
     this.socket = new WebSocket(url, ["token", DEEPGRAM_KEY]);
 
     this.socket.onopen = () => {
-      console.log("[KIMI STT] WebSocket connected");
+      console.log("[KIMI STT] Connected");
+      this.sttReconnecting = false;
       this.callbacks.onStateChange("listening");
-      this.startRecording();
+
+      // Send keepalive every 8s to prevent timeout
+      this.keepAliveInterval = setInterval(() => {
+        if (this.socket?.readyState === WebSocket.OPEN) {
+          this.socket.send(JSON.stringify({ type: "KeepAlive" }));
+        }
+      }, 8000);
     };
 
     this.socket.onmessage = (event) => {
@@ -104,27 +152,50 @@ export class VoicePipeline {
         const data = JSON.parse(event.data);
 
         if (data.type === "Results") {
-          const transcript = data.channel?.alternatives?.[0]?.transcript;
-          if (!transcript) return;
+          const alt = data.channel?.alternatives?.[0];
+          if (!alt || !alt.transcript) return;
+
+          const text = alt.transcript.trim();
+          if (!text) return;
 
           if (data.is_final) {
-            console.log("[KIMI STT] Final:", transcript);
-            // Accumulate final transcripts, process on utterance end
+            console.log("[KIMI STT] Final:", text);
+            this.pendingFinals.push(text);
+
+            // If user speaks while AI is talking, interrupt
+            if (this.currentAudio) {
+              console.log("[KIMI] Interrupting TTS");
+              this.interruptTTS();
+            }
+
+            // Debounce: wait for silence before processing
+            if (this.utteranceTimer) clearTimeout(this.utteranceTimer);
+            this.utteranceTimer = setTimeout(() => {
+              if (this.pendingFinals.length > 0 && !this.isProcessing) {
+                const fullText = this.pendingFinals.join(" ").trim();
+                this.pendingFinals = [];
+                if (fullText) this.handleUserUtterance(fullText);
+              }
+            }, 700);
           } else {
-            this.callbacks.onInterimTranscript(transcript);
+            this.callbacks.onInterimTranscript(text);
+
+            // Interrupt on interim speech too
+            if (this.currentAudio && text.length > 3) {
+              console.log("[KIMI] Interrupting TTS (interim)");
+              this.interruptTTS();
+            }
           }
         }
 
         if (data.type === "UtteranceEnd") {
-          // Collect all final text from recent results
           console.log("[KIMI STT] Utterance ended");
-        }
-
-        // Handle speech_final for immediate processing
-        if (data.type === "Results" && data.speech_final && data.channel?.alternatives?.[0]?.transcript) {
-          const finalText = data.channel.alternatives[0].transcript.trim();
-          if (finalText) {
-            this.handleUserUtterance(finalText);
+          // Process pending finals immediately
+          if (this.pendingFinals.length > 0 && !this.isProcessing) {
+            if (this.utteranceTimer) clearTimeout(this.utteranceTimer);
+            const fullText = this.pendingFinals.join(" ").trim();
+            this.pendingFinals = [];
+            if (fullText) this.handleUserUtterance(fullText);
           }
         }
       } catch (err) {
@@ -133,96 +204,62 @@ export class VoicePipeline {
     };
 
     this.socket.onerror = (err) => {
-      console.error("[KIMI STT] WebSocket error:", err);
-      this.callbacks.onError("STT connection error. Check your Deepgram API key.");
+      console.error("[KIMI STT] Error:", err);
     };
 
     this.socket.onclose = (event) => {
-      console.log("[KIMI STT] WebSocket closed:", event.code, event.reason);
-      if (this.isRunning) {
-        this.callbacks.onError("STT connection closed unexpectedly.");
+      console.log("[KIMI STT] Closed:", event.code, event.reason);
+      if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
+
+      // Auto-reconnect if still running
+      if (this.isRunning && !this.sttReconnecting) {
+        this.sttReconnecting = true;
+        console.log("[KIMI STT] Reconnecting in 500ms...");
+        setTimeout(() => this.connectSTT(), 500);
       }
     };
   }
 
-  private startRecording() {
-    if (!this.mediaStream) return;
-
-    // Check for supported MIME types
-    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-      ? "audio/webm;codecs=opus"
-      : MediaRecorder.isTypeSupported("audio/webm")
-      ? "audio/webm"
-      : "audio/mp4";
-
-    console.log("[KIMI STT] Recording with MIME:", mimeType);
-
-    this.mediaRecorder = new MediaRecorder(this.mediaStream, {
-      mimeType,
-    });
-
-    this.mediaRecorder.ondataavailable = (event) => {
-      if (event.data.size > 0 && this.socket?.readyState === WebSocket.OPEN) {
-        this.socket.send(event.data);
-      }
-    };
-
-    this.mediaRecorder.start(100); // Send chunks every 100ms
-    console.log("[KIMI STT] MediaRecorder started");
+  private interruptTTS() {
+    if (this.currentAudio) {
+      this.currentAudio.pause();
+      this.currentAudio.src = "";
+      this.currentAudio = null;
+    }
+    this.isProcessing = false;
+    this.callbacks.onStateChange("listening");
   }
 
   private async handleUserUtterance(text: string) {
-    console.log("[KIMI] User said:", text);
+    if (this.isProcessing) return;
+    this.isProcessing = true;
 
-    // Add to transcript
-    this.callbacks.onFinalTranscript({
-      role: "user",
-      text,
-      timestamp: new Date(),
-    });
-
+    console.log("[KIMI] User:", text);
+    this.callbacks.onFinalTranscript({ role: "user", text, timestamp: new Date() });
     this.callbacks.onInterimTranscript("");
     this.callbacks.onStateChange("thinking");
 
-    // Pause recording while processing
-    if (this.mediaRecorder?.state === "recording") {
-      this.mediaRecorder.pause();
-    }
-
     try {
-      // Step 2: Send to Fireworks LLM
       const llmResponse = await this.callLLM(text);
-      console.log("[KIMI LLM] Response:", llmResponse);
+      console.log("[KIMI LLM]:", llmResponse);
 
-      this.callbacks.onFinalTranscript({
-        role: "assistant",
-        text: llmResponse,
-        timestamp: new Date(),
-      });
-
-      // Step 3: TTS with Deepgram
+      this.callbacks.onFinalTranscript({ role: "assistant", text: llmResponse, timestamp: new Date() });
       this.callbacks.onStateChange("speaking");
       await this.speakText(llmResponse);
-
-      // Resume listening
-      this.callbacks.onStateChange("listening");
-      if (this.mediaRecorder?.state === "paused") {
-        this.mediaRecorder.resume();
-      }
     } catch (err: any) {
-      console.error("[KIMI] Pipeline error:", err);
+      console.error("[KIMI] Error:", err);
       this.callbacks.onError(err.message || "Pipeline error");
+    }
+
+    this.isProcessing = false;
+    if (this.isRunning) {
       this.callbacks.onStateChange("listening");
-      if (this.mediaRecorder?.state === "paused") {
-        this.mediaRecorder.resume();
-      }
     }
   }
 
   private async callLLM(userMessage: string): Promise<string> {
     this.conversationHistory.push({ role: "user", content: userMessage });
 
-    console.log("[KIMI LLM] Calling Fireworks AI...");
     const response = await fetch(
       "https://api.fireworks.ai/inference/v1/chat/completions",
       {
@@ -234,29 +271,26 @@ export class VoicePipeline {
         body: JSON.stringify({
           model: FIREWORKS_MODEL,
           messages: this.conversationHistory,
-          max_tokens: 200,
+          max_tokens: 80,
           temperature: 0.6,
-          top_p: 1,
         }),
       }
     );
 
     if (!response.ok) {
       const errBody = await response.text();
-      console.error("[KIMI LLM] Error:", response.status, errBody);
       throw new Error(`LLM error [${response.status}]: ${errBody}`);
     }
 
     const data = await response.json();
-    const reply = data.choices?.[0]?.message?.content?.trim() || "I'm sorry, I couldn't process that.";
-
+    const reply = data.choices?.[0]?.message?.content?.trim() || "Sorry, I didn't catch that.";
     this.conversationHistory.push({ role: "assistant", content: reply });
 
-    // Keep conversation history manageable
-    if (this.conversationHistory.length > 20) {
+    // Keep history manageable
+    if (this.conversationHistory.length > 16) {
       this.conversationHistory = [
-        this.conversationHistory[0], // system prompt
-        ...this.conversationHistory.slice(-10),
+        this.conversationHistory[0],
+        ...this.conversationHistory.slice(-8),
       ];
     }
 
@@ -264,8 +298,6 @@ export class VoicePipeline {
   }
 
   private async speakText(text: string): Promise<void> {
-    console.log("[KIMI TTS] Requesting Deepgram TTS...");
-
     const response = await fetch(
       "https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mp3",
       {
@@ -280,30 +312,31 @@ export class VoicePipeline {
 
     if (!response.ok) {
       const errBody = await response.text();
-      console.error("[KIMI TTS] Error:", response.status, errBody);
       throw new Error(`TTS error [${response.status}]: ${errBody}`);
     }
 
-    console.log("[KIMI TTS] Got audio, playing...");
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
 
-    const audioBlob = await response.blob();
-    const audioUrl = URL.createObjectURL(audioBlob);
+    return new Promise<void>((resolve) => {
+      const audio = new Audio(url);
+      this.currentAudio = audio;
 
-    return new Promise<void>((resolve, reject) => {
-      const audio = new Audio(audioUrl);
       audio.onended = () => {
-        URL.revokeObjectURL(audioUrl);
-        console.log("[KIMI TTS] Playback complete");
+        URL.revokeObjectURL(url);
+        this.currentAudio = null;
         resolve();
       };
-      audio.onerror = (e) => {
-        URL.revokeObjectURL(audioUrl);
-        console.error("[KIMI TTS] Playback error:", e);
-        reject(new Error("Audio playback failed"));
+
+      audio.onerror = () => {
+        URL.revokeObjectURL(url);
+        this.currentAudio = null;
+        resolve(); // Don't throw, just continue
       };
-      audio.play().catch((err) => {
-        console.error("[KIMI TTS] Play() failed:", err);
-        reject(err);
+
+      audio.play().catch(() => {
+        this.currentAudio = null;
+        resolve();
       });
     });
   }
@@ -311,12 +344,20 @@ export class VoicePipeline {
   stop() {
     this.isRunning = false;
 
-    if (this.animationFrame) {
-      cancelAnimationFrame(this.animationFrame);
+    if (this.animationFrame) cancelAnimationFrame(this.animationFrame);
+    if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
+    if (this.utteranceTimer) clearTimeout(this.utteranceTimer);
+
+    this.interruptTTS();
+
+    if (this.scriptProcessor) {
+      this.scriptProcessor.disconnect();
+      this.scriptProcessor = null;
     }
 
-    if (this.mediaRecorder && this.mediaRecorder.state !== "inactive") {
-      this.mediaRecorder.stop();
+    if (this.sourceNode) {
+      this.sourceNode.disconnect();
+      this.sourceNode = null;
     }
 
     if (this.socket) {
@@ -324,18 +365,22 @@ export class VoicePipeline {
         this.socket.send(JSON.stringify({ type: "CloseStream" }));
       }
       this.socket.close();
+      this.socket = null;
     }
 
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach((t) => t.stop());
+      this.mediaStream = null;
     }
 
     if (this.audioContext) {
       this.audioContext.close();
+      this.audioContext = null;
     }
 
     this.callbacks.onStateChange("idle");
     this.callbacks.onAudioLevel(0);
-    console.log("[KIMI] Pipeline stopped");
+    this.callbacks.onWaveformData([]);
+    console.log("[KIMI] Stopped");
   }
 }
