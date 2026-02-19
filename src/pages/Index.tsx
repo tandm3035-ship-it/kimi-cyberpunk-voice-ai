@@ -77,7 +77,7 @@ const Index = () => {
           }}
         >
           <Mic className="h-7 w-7" />
-          {isStarting ? "STARTING..." : "START CALL"}
+          {isStarting ? "STARTING..." : "Start agent ROX"}
         </button>
       ) : (
         <button
