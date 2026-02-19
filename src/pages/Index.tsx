@@ -3,10 +3,11 @@ import { VoicePipeline, PipelineState, TranscriptEntry } from "@/lib/voice-pipel
 import VoiceOrb from "@/components/VoiceOrb";
 import Transcript from "@/components/Transcript";
 import Waveform from "@/components/Waveform";
-import { Mic, MicOff, PhoneOff } from "lucide-react";
+import { Mic, PhoneOff } from "lucide-react";
 
 const Index = () => {
   const [state, setState] = useState<PipelineState>("idle");
+  const [isStarting, setIsStarting] = useState(false);
   const [audioLevel, setAudioLevel] = useState(0);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [interimText, setInterimText] = useState("");
@@ -14,7 +15,10 @@ const Index = () => {
   const [error, setError] = useState("");
   const pipelineRef = useRef<VoicePipeline | null>(null);
 
-  const handleStart = useCallback(() => {
+  const handleStart = useCallback(async () => {
+    if (isStarting) return;
+
+    setIsStarting(true);
     setError("");
     setTranscript([]);
     const pipeline = new VoicePipeline({
@@ -26,8 +30,9 @@ const Index = () => {
       onWaveformData: setWaveformData,
     });
     pipelineRef.current = pipeline;
-    pipeline.start();
-  }, []);
+    await pipeline.start();
+    setIsStarting(false);
+  }, [isStarting]);
 
   const handleStop = useCallback(() => {
     pipelineRef.current?.stop();
@@ -64,6 +69,7 @@ const Index = () => {
       {!isActive ? (
         <button
           onClick={handleStart}
+          disabled={isStarting}
           className="relative z-10 flex items-center gap-3 rounded-full px-14 py-6 font-display text-xl font-bold tracking-[0.15em] uppercase bg-primary/20 border-2 border-primary text-primary hover:bg-primary/30 neon-border transition-all duration-300"
           style={{
             boxShadow:
@@ -71,7 +77,7 @@ const Index = () => {
           }}
         >
           <Mic className="h-7 w-7" />
-          START CALL
+          {isStarting ? "STARTING..." : "Start agent ROX"}
         </button>
       ) : (
         <button
