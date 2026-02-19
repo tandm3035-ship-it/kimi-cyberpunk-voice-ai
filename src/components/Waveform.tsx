@@ -8,10 +8,10 @@ interface WaveformProps {
 const Waveform = ({ data, state }: WaveformProps) => {
   const barCount = data.length || 64;
   const color =
-    state === "speaking"
+    state === "thinking"
+      ? "hsl(0 100% 55%)"
+      : state === "speaking"
       ? "hsl(120 100% 60%)"
-      : state === "thinking"
-      ? "hsl(120 100% 40%)"
       : "hsl(120 100% 50%)";
 
   return (

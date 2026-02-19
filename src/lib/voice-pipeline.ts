@@ -1,9 +1,8 @@
-// Voice pipeline: Deepgram STT (WebSocket) → Fireworks LLM → Deepgram TTS
-// Rebuilt for phone-call speed with interruption support
+// Voice pipeline: Deepgram Unified Voice Agent API (single WebSocket)
+// wss://agent.deepgram.com/v1/agent/converse
+// Handles STT + LLM + TTS in one connection with native barge-in
 
 const DEEPGRAM_KEY = "3509fd08965bd3e0d97585827ab5291c15f75364";
-const FIREWORKS_KEY = "fw_Uvswjw47Hd39egTHkMEqwV";
-const FIREWORKS_MODEL = "accounts/fireworks/models/kimi-k2-instruct-0905";
 
 export type PipelineState = "idle" | "listening" | "thinking" | "speaking";
 
@@ -25,30 +24,25 @@ interface PipelineCallbacks {
 export class VoicePipeline {
   private mediaStream: MediaStream | null = null;
   private audioContext: AudioContext | null = null;
+  private playbackContext: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private scriptProcessor: ScriptProcessorNode | null = null;
   private sourceNode: MediaStreamAudioSourceNode | null = null;
   private animationFrame: number | null = null;
   private socket: WebSocket | null = null;
-  private conversationHistory: { role: string; content: string }[] = [];
   private callbacks: PipelineCallbacks;
   private isRunning = false;
-  private currentAudio: HTMLAudioElement | null = null;
-  private pendingFinals: string[] = [];
-  private utteranceTimer: ReturnType<typeof setTimeout> | null = null;
-  private keepAliveInterval: ReturnType<typeof setInterval> | null = null;
-  private isProcessing = false;
-  private sttReconnecting = false;
+
+  // Audio playback buffer system
+  private audioQueue: AudioBuffer[] = [];
+  private isPlaying = false;
+  private currentSource: AudioBufferSourceNode | null = null;
+  private pendingAudioChunks: Int16Array[] = [];
+  private readonly BUFFER_SIZE = 3200; // samples per buffer chunk
+  private pendingSamples = 0;
 
   constructor(callbacks: PipelineCallbacks) {
     this.callbacks = callbacks;
-    this.conversationHistory = [
-      {
-        role: "system",
-        content:
-          "You are KIMI, a cutting-edge AI voice assistant. Be extremely concise—respond in ONE short sentence max. Speak naturally like a phone call. Be warm but ultra-brief.",
-      },
-    ];
   }
 
   async start() {
@@ -66,6 +60,7 @@ export class VoicePipeline {
       });
 
       this.audioContext = new AudioContext({ sampleRate: 16000 });
+      this.playbackContext = new AudioContext({ sampleRate: 24000 });
       this.sourceNode = this.audioContext.createMediaStreamSource(this.mediaStream);
 
       // Analyser for visual waveform
@@ -74,7 +69,7 @@ export class VoicePipeline {
       this.sourceNode.connect(this.analyser);
       this.monitorAudio();
 
-      // ScriptProcessor to get raw PCM and send to Deepgram
+      // ScriptProcessor to capture raw PCM and send to agent
       this.scriptProcessor = this.audioContext.createScriptProcessor(4096, 1, 1);
       this.sourceNode.connect(this.scriptProcessor);
       this.scriptProcessor.connect(this.audioContext.destination);
@@ -82,7 +77,6 @@ export class VoicePipeline {
       this.scriptProcessor.onaudioprocess = (e) => {
         if (!this.isRunning || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
         const float32 = e.inputBuffer.getChannelData(0);
-        // Convert float32 to int16 PCM
         const int16 = new Int16Array(float32.length);
         for (let i = 0; i < float32.length; i++) {
           const s = Math.max(-1, Math.min(1, float32[i]));
@@ -91,7 +85,7 @@ export class VoicePipeline {
         this.socket.send(int16.buffer);
       };
 
-      this.connectSTT();
+      this.connectAgent();
     } catch (err: any) {
       console.error("[KIMI] Mic error:", err);
       this.callbacks.onError("Microphone access denied.");
@@ -107,12 +101,10 @@ export class VoicePipeline {
     const tick = () => {
       if (!this.analyser || !this.isRunning) return;
 
-      // Frequency data for level
       this.analyser.getByteFrequencyData(freqData);
       const avg = freqData.reduce((a, b) => a + b, 0) / freqData.length;
       this.callbacks.onAudioLevel(avg / 255);
 
-      // Time-domain data for waveform
       this.analyser.getByteTimeDomainData(timeData);
       const waveform: number[] = [];
       const step = Math.floor(timeData.length / 64);
@@ -126,229 +118,223 @@ export class VoicePipeline {
     tick();
   }
 
-  private connectSTT() {
+  private connectAgent() {
     if (!this.isRunning) return;
-    console.log("[KIMI STT] Connecting...");
+    console.log("[KIMI Agent] Connecting to Deepgram Voice Agent...");
 
-    const url = `wss://api.deepgram.com/v1/listen?model=nova-2&language=en&smart_format=true&interim_results=true&utterance_end_ms=2000&vad_events=true&endpointing=800&encoding=linear16&sample_rate=16000&channels=1`;
-
+    const url = "wss://agent.deepgram.com/v1/agent/converse";
     this.socket = new WebSocket(url, ["token", DEEPGRAM_KEY]);
 
     this.socket.onopen = () => {
-      console.log("[KIMI STT] Connected");
-      this.sttReconnecting = false;
-      this.callbacks.onStateChange("listening");
+      console.log("[KIMI Agent] WebSocket open, sending settings...");
 
-      // Send keepalive every 8s to prevent timeout
-      this.keepAliveInterval = setInterval(() => {
-        if (this.socket?.readyState === WebSocket.OPEN) {
-          this.socket.send(JSON.stringify({ type: "KeepAlive" }));
-        }
-      }, 8000);
+      // Send SettingsConfiguration
+      const settings = {
+        type: "SettingsConfiguration",
+        audio: {
+          input: {
+            encoding: "linear16",
+            sample_rate: 16000,
+          },
+          output: {
+            encoding: "linear16",
+            sample_rate: 24000,
+            container: "none",
+          },
+        },
+        agent: {
+          listen: {
+            model: "nova-3",
+          },
+          think: {
+            provider: { type: "open_ai" },
+            model: "gpt-4o-mini",
+            instructions: "You are KIMI, a cutting-edge AI voice assistant. Be extremely concise—respond in ONE short sentence max. Speak naturally like a phone call. Be warm but ultra-brief.",
+          },
+          speak: {
+            model: "aura-asteria-en",
+          },
+          greeting: "Hello! I am your lightning-fast assistant. How can I help you today?",
+        },
+      };
+
+      this.socket!.send(JSON.stringify(settings));
     };
 
     this.socket.onmessage = (event) => {
+      if (event.data instanceof Blob) {
+        // Binary audio data from agent TTS
+        this.handleAudioBlob(event.data);
+        return;
+      }
+
       try {
-        const data = JSON.parse(event.data);
-
-        if (data.type === "Results") {
-          const alt = data.channel?.alternatives?.[0];
-          if (!alt || !alt.transcript) return;
-
-          const text = alt.transcript.trim();
-          if (!text) return;
-
-          if (data.is_final) {
-            console.log("[KIMI STT] Final:", text);
-            this.pendingFinals.push(text);
-
-            // If user speaks while AI is talking, interrupt
-            if (this.currentAudio) {
-              console.log("[KIMI] Interrupting TTS");
-              this.interruptTTS();
-            }
-
-            // Debounce: wait for silence before processing
-            if (this.utteranceTimer) clearTimeout(this.utteranceTimer);
-            this.utteranceTimer = setTimeout(() => {
-              if (this.pendingFinals.length > 0 && !this.isProcessing) {
-                const fullText = this.pendingFinals.join(" ").trim();
-                this.pendingFinals = [];
-                if (fullText) this.handleUserUtterance(fullText);
-              }
-            }, 1200);
-          } else {
-            this.callbacks.onInterimTranscript(text);
-
-            // Interrupt on interim speech too (only on substantial speech)
-            if (this.currentAudio && text.split(" ").length >= 3) {
-              console.log("[KIMI] Interrupting TTS (interim)");
-              this.interruptTTS();
-            }
-          }
-        }
-
-        if (data.type === "UtteranceEnd") {
-          console.log("[KIMI STT] Utterance ended");
-          // Process pending finals immediately
-          if (this.pendingFinals.length > 0 && !this.isProcessing) {
-            if (this.utteranceTimer) clearTimeout(this.utteranceTimer);
-            const fullText = this.pendingFinals.join(" ").trim();
-            this.pendingFinals = [];
-            if (fullText) this.handleUserUtterance(fullText);
-          }
-        }
+        const msg = JSON.parse(event.data);
+        this.handleAgentMessage(msg);
       } catch (err) {
-        console.error("[KIMI STT] Parse error:", err);
+        console.error("[KIMI Agent] Parse error:", err);
       }
     };
 
     this.socket.onerror = (err) => {
-      console.error("[KIMI STT] Error:", err);
+      console.error("[KIMI Agent] WebSocket error:", err);
+      this.callbacks.onError("Voice agent connection error.");
     };
 
     this.socket.onclose = (event) => {
-      console.log("[KIMI STT] Closed:", event.code, event.reason);
-      if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
-
-      // Auto-reconnect if still running
-      if (this.isRunning && !this.sttReconnecting) {
-        this.sttReconnecting = true;
-        console.log("[KIMI STT] Reconnecting in 500ms...");
-        setTimeout(() => this.connectSTT(), 500);
+      console.log("[KIMI Agent] Closed:", event.code, event.reason);
+      if (this.isRunning) {
+        console.log("[KIMI Agent] Reconnecting in 1s...");
+        setTimeout(() => this.connectAgent(), 1000);
       }
     };
   }
 
-  private interruptTTS() {
-    if (this.currentAudio) {
-      this.currentAudio.pause();
-      this.currentAudio.src = "";
-      this.currentAudio = null;
+  private handleAgentMessage(msg: any) {
+    const type = msg.type;
+
+    switch (type) {
+      case "Welcome":
+        console.log("[KIMI Agent] Welcome received");
+        break;
+
+      case "SettingsApplied":
+        console.log("[KIMI Agent] Settings applied");
+        this.callbacks.onStateChange("listening");
+        break;
+
+      case "UserStartedSpeaking":
+        console.log("[KIMI Agent] User started speaking — BARGE-IN");
+        this.interruptPlayback();
+        this.callbacks.onStateChange("listening");
+        break;
+
+      case "ConversationText":
+        this.handleConversationText(msg);
+        break;
+
+      case "AgentThinking":
+        console.log("[KIMI Agent] Thinking...");
+        this.callbacks.onStateChange("thinking");
+        break;
+
+      case "AgentStartedSpeaking":
+        console.log("[KIMI Agent] Speaking...");
+        this.callbacks.onStateChange("speaking");
+        break;
+
+      case "AgentAudioDone":
+        console.log("[KIMI Agent] Audio done");
+        // State will go back to listening after playback finishes
+        break;
+
+      default:
+        console.log("[KIMI Agent] Event:", type, msg);
     }
-    this.isProcessing = false;
-    this.callbacks.onStateChange("listening");
   }
 
-  private async handleUserUtterance(text: string) {
-    if (this.isProcessing) return;
-    this.isProcessing = true;
+  private handleConversationText(msg: any) {
+    const role = msg.role as "user" | "assistant";
+    const content = msg.content || "";
 
-    console.log("[KIMI] User:", text);
-    this.callbacks.onFinalTranscript({ role: "user", text, timestamp: new Date() });
-    this.callbacks.onInterimTranscript("");
-    this.callbacks.onStateChange("thinking");
+    if (!content) return;
 
-    try {
-      const llmResponse = await this.callLLM(text);
-      console.log("[KIMI LLM]:", llmResponse);
-
-      this.callbacks.onFinalTranscript({ role: "assistant", text: llmResponse, timestamp: new Date() });
-      this.callbacks.onStateChange("speaking");
-      await this.speakText(llmResponse);
-    } catch (err: any) {
-      console.error("[KIMI] Error:", err);
-      this.callbacks.onError(err.message || "Pipeline error");
-    }
-
-    this.isProcessing = false;
-    if (this.isRunning) {
-      this.callbacks.onStateChange("listening");
-    }
-  }
-
-  private async callLLM(userMessage: string): Promise<string> {
-    this.conversationHistory.push({ role: "user", content: userMessage });
-
-    const response = await fetch(
-      "https://api.fireworks.ai/inference/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${FIREWORKS_KEY}`,
-        },
-        body: JSON.stringify({
-          model: FIREWORKS_MODEL,
-          messages: this.conversationHistory,
-          max_tokens: 80,
-          temperature: 0.6,
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      const errBody = await response.text();
-      throw new Error(`LLM error [${response.status}]: ${errBody}`);
-    }
-
-    const data = await response.json();
-    const reply = data.choices?.[0]?.message?.content?.trim() || "Sorry, I didn't catch that.";
-    this.conversationHistory.push({ role: "assistant", content: reply });
-
-    // Keep history manageable
-    if (this.conversationHistory.length > 16) {
-      this.conversationHistory = [
-        this.conversationHistory[0],
-        ...this.conversationHistory.slice(-8),
-      ];
-    }
-
-    return reply;
-  }
-
-  private async speakText(text: string): Promise<void> {
-    const response = await fetch(
-      "https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mp3",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Token ${DEEPGRAM_KEY}`,
-          "Content-Type": "text/plain",
-        },
-        body: text,
-      }
-    );
-
-    if (!response.ok) {
-      const errBody = await response.text();
-      throw new Error(`TTS error [${response.status}]: ${errBody}`);
-    }
-
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-
-    return new Promise<void>((resolve) => {
-      const audio = new Audio(url);
-      this.currentAudio = audio;
-
-      audio.onended = () => {
-        URL.revokeObjectURL(url);
-        this.currentAudio = null;
-        resolve();
-      };
-
-      audio.onerror = () => {
-        URL.revokeObjectURL(url);
-        this.currentAudio = null;
-        resolve(); // Don't throw, just continue
-      };
-
-      audio.play().catch(() => {
-        this.currentAudio = null;
-        resolve();
-      });
+    console.log(`[KIMI Agent] ${role}: ${content}`);
+    this.callbacks.onFinalTranscript({
+      role,
+      text: content,
+      timestamp: new Date(),
     });
+  }
+
+  private async handleAudioBlob(blob: Blob) {
+    const arrayBuffer = await blob.arrayBuffer();
+    const int16 = new Int16Array(arrayBuffer);
+
+    // Buffer system: accumulate samples and create playback buffers
+    this.pendingAudioChunks.push(int16);
+    this.pendingSamples += int16.length;
+
+    if (this.pendingSamples >= this.BUFFER_SIZE) {
+      this.flushAudioBuffer();
+    }
+  }
+
+  private flushAudioBuffer() {
+    if (!this.playbackContext || this.pendingAudioChunks.length === 0) return;
+
+    // Combine all pending chunks
+    const totalLength = this.pendingAudioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const combined = new Int16Array(totalLength);
+    let offset = 0;
+    for (const chunk of this.pendingAudioChunks) {
+      combined.set(chunk, offset);
+      offset += chunk.length;
+    }
+    this.pendingAudioChunks = [];
+    this.pendingSamples = 0;
+
+    // Convert int16 to float32
+    const float32 = new Float32Array(combined.length);
+    for (let i = 0; i < combined.length; i++) {
+      float32[i] = combined[i] / 32768;
+    }
+
+    // Create AudioBuffer
+    const audioBuffer = this.playbackContext.createBuffer(1, float32.length, 24000);
+    audioBuffer.getChannelData(0).set(float32);
+
+    this.audioQueue.push(audioBuffer);
+
+    if (!this.isPlaying) {
+      this.playNextBuffer();
+    }
+  }
+
+  private playNextBuffer() {
+    if (!this.playbackContext || this.audioQueue.length === 0) {
+      this.isPlaying = false;
+      if (this.isRunning) {
+        this.callbacks.onStateChange("listening");
+      }
+      return;
+    }
+
+    this.isPlaying = true;
+    const buffer = this.audioQueue.shift()!;
+    const source = this.playbackContext.createBufferSource();
+    source.buffer = buffer;
+    source.connect(this.playbackContext.destination);
+    this.currentSource = source;
+
+    source.onended = () => {
+      this.currentSource = null;
+      this.playNextBuffer();
+    };
+
+    source.start();
+  }
+
+  private interruptPlayback() {
+    // Immediately stop all outgoing audio (barge-in)
+    if (this.currentSource) {
+      try {
+        this.currentSource.stop();
+      } catch (_) {}
+      this.currentSource = null;
+    }
+    this.audioQueue = [];
+    this.pendingAudioChunks = [];
+    this.pendingSamples = 0;
+    this.isPlaying = false;
   }
 
   stop() {
     this.isRunning = false;
 
     if (this.animationFrame) cancelAnimationFrame(this.animationFrame);
-    if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
-    if (this.utteranceTimer) clearTimeout(this.utteranceTimer);
 
-    this.interruptTTS();
+    this.interruptPlayback();
 
     if (this.scriptProcessor) {
       this.scriptProcessor.disconnect();
@@ -362,9 +348,8 @@ export class VoicePipeline {
 
     if (this.socket) {
       if (this.socket.readyState === WebSocket.OPEN) {
-        this.socket.send(JSON.stringify({ type: "CloseStream" }));
+        this.socket.close();
       }
-      this.socket.close();
       this.socket = null;
     }
 
@@ -376,6 +361,11 @@ export class VoicePipeline {
     if (this.audioContext) {
       this.audioContext.close();
       this.audioContext = null;
+    }
+
+    if (this.playbackContext) {
+      this.playbackContext.close();
+      this.playbackContext = null;
     }
 
     this.callbacks.onStateChange("idle");
