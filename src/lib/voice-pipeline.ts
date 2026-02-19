@@ -32,6 +32,8 @@ export class VoicePipeline {
   private socket: WebSocket | null = null;
   private callbacks: PipelineCallbacks;
   private isRunning = false;
+  private reconnectAttempts = 0;
+  private readonly MAX_RECONNECTS = 5;
 
   // Audio playback buffer system
   private audioQueue: AudioBuffer[] = [];
@@ -130,7 +132,7 @@ export class VoicePipeline {
 
       // Send SettingsConfiguration
       const settings = {
-        type: "SettingsConfiguration",
+        type: "Settings",
         audio: {
           input: {
             encoding: "linear16",
@@ -144,12 +146,15 @@ export class VoicePipeline {
         },
         agent: {
           listen: {
-            model: "nova-3",
+            provider: {
+              type: "deepgram",
+              model: "nova-3",
+            },
           },
           think: {
             provider: { type: "open_ai" },
             model: "gpt-4o-mini",
-            instructions: "You are KIMI, a cutting-edge AI voice assistant. Be extremely concise—respond in ONE short sentence max. Speak naturally like a phone call. Be warm but ultra-brief.",
+            instructions: "You are KIMI, a cutting-edge AI voice assistant. Be extremely concise—respond in ONE short sentence max. Speak naturally like a phone call. Be warm but ultra-brief. Never repeat yourself. Each response must be unique and directly address only what the user just said.",
           },
           speak: {
             model: "aura-asteria-en",
@@ -183,9 +188,14 @@ export class VoicePipeline {
 
     this.socket.onclose = (event) => {
       console.log("[KIMI Agent] Closed:", event.code, event.reason);
-      if (this.isRunning) {
-        console.log("[KIMI Agent] Reconnecting in 1s...");
+      if (this.isRunning && this.reconnectAttempts < this.MAX_RECONNECTS) {
+        this.reconnectAttempts++;
+        console.log(`[KIMI Agent] Reconnecting (${this.reconnectAttempts}/${this.MAX_RECONNECTS}) in 1s...`);
         setTimeout(() => this.connectAgent(), 1000);
+      } else if (this.reconnectAttempts >= this.MAX_RECONNECTS) {
+        console.error("[KIMI Agent] Max reconnects reached, stopping.");
+        this.callbacks.onError("Connection lost. Please restart the call.");
+        this.stop();
       }
     };
   }
@@ -200,6 +210,7 @@ export class VoicePipeline {
 
       case "SettingsApplied":
         console.log("[KIMI Agent] Settings applied");
+        this.reconnectAttempts = 0; // Reset on successful connection
         this.callbacks.onStateChange("listening");
         break;
 
