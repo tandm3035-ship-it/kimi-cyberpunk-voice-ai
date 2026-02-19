@@ -152,12 +152,14 @@ export class VoicePipeline {
             },
           },
           think: {
-            provider: { type: "open_ai" },
-            model: "gpt-4o-mini",
+            provider: { type: "open_ai", model: "gpt-4o-mini" },
             instructions: "You are KIMI, a cutting-edge AI voice assistant. Be extremely concise—respond in ONE short sentence max. Speak naturally like a phone call. Be warm but ultra-brief. Never repeat yourself. Each response must be unique and directly address only what the user just said.",
           },
           speak: {
-            model: "aura-asteria-en",
+            provider: {
+              type: "deepgram",
+              model: "aura-asteria-en",
+            },
           },
           greeting: "Hello! I am your lightning-fast assistant. How can I help you today?",
         },
