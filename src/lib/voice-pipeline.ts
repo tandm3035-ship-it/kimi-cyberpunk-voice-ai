@@ -1,8 +1,5 @@
-// Voice pipeline: Deepgram Unified Voice Agent API (single WebSocket)
-// wss://agent.deepgram.com/v1/agent/converse
-// Handles STT + LLM + TTS in one connection with native barge-in
-
-const DEEPGRAM_KEY = import.meta.env.VITE_DEEPGRAM_API_KEY;
+// Voice pipeline: LiveKit-powered ultra-low-latency voice AI
+import { Room, RoomEvent, Track, type RemoteParticipant, type RemoteTrackPublication, type RemoteTrack } from "livekit-client";
 
 export type PipelineState = "idle" | "listening" | "thinking" | "speaking";
 
@@ -22,27 +19,12 @@ interface PipelineCallbacks {
 }
 
 export class VoicePipeline {
-  private mediaStream: MediaStream | null = null;
+  private room: Room | null = null;
   private audioContext: AudioContext | null = null;
-  private playbackContext: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
-  private scriptProcessor: ScriptProcessorNode | null = null;
-  private sourceNode: MediaStreamAudioSourceNode | null = null;
-  private silentGainNode: GainNode | null = null;
   private animationFrame: number | null = null;
-  private socket: WebSocket | null = null;
   private callbacks: PipelineCallbacks;
   private isRunning = false;
-  private reconnectAttempts = 0;
-  private readonly MAX_RECONNECTS = 5;
-
-  // Audio playback buffer system
-  private audioQueue: AudioBuffer[] = [];
-  private isPlaying = false;
-  private currentSource: AudioBufferSourceNode | null = null;
-  private pendingAudioChunks: Int16Array[] = [];
-  private readonly BUFFER_SIZE = 3200; // samples per buffer chunk
-  private pendingSamples = 0;
 
   constructor(callbacks: PipelineCallbacks) {
     this.callbacks = callbacks;
@@ -50,65 +32,144 @@ export class VoicePipeline {
 
   async start() {
     if (this.isRunning) return;
-
-    if (!DEEPGRAM_KEY) {
-      this.callbacks.onError("Missing API key. Set VITE_DEEPGRAM_API_KEY in your environment.");
-      return;
-    }
-
     this.isRunning = true;
 
     try {
-      this.mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          sampleRate: 16000,
-          channelCount: 1,
+      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+      const supabaseKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+
+      const res = await fetch(`${supabaseUrl}/functions/v1/livekit-token`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${supabaseKey}`,
         },
       });
 
-      this.audioContext = new AudioContext({ sampleRate: 16000 });
-      this.playbackContext = new AudioContext({ sampleRate: 24000 });
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Token error: ${errText}`);
+      }
 
-      await this.audioContext.resume();
-      await this.playbackContext.resume();
+      const { token, url } = await res.json();
 
-      this.sourceNode = this.audioContext.createMediaStreamSource(this.mediaStream);
+      this.room = new Room({
+        adaptiveStream: true,
+        dynacast: true,
+        audioCaptureDefaults: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
 
-      // Analyser for visual waveform
-      this.analyser = this.audioContext.createAnalyser();
-      this.analyser.fftSize = 256;
-      this.sourceNode.connect(this.analyser);
-      this.monitorAudio();
+      this.setupRoomEvents();
 
-      // ScriptProcessor to capture raw PCM and send to agent
-      this.scriptProcessor = this.audioContext.createScriptProcessor(4096, 1, 1);
-      this.silentGainNode = this.audioContext.createGain();
-      this.silentGainNode.gain.value = 0;
+      await this.room.connect(url, token);
+      await this.room.localParticipant.setMicrophoneEnabled(true);
 
-      this.sourceNode.connect(this.scriptProcessor);
-      this.scriptProcessor.connect(this.silentGainNode);
-      this.silentGainNode.connect(this.audioContext.destination);
+      // Set up audio monitoring after mic is enabled
+      setTimeout(() => this.setupAudioMonitoring(), 500);
 
-      this.scriptProcessor.onaudioprocess = (e) => {
-        if (!this.isRunning || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-        const float32 = e.inputBuffer.getChannelData(0);
-        const int16 = new Int16Array(float32.length);
-        for (let i = 0; i < float32.length; i++) {
-          const s = Math.max(-1, Math.min(1, float32[i]));
-          int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-        }
-        this.socket.send(int16.buffer);
-      };
-
-      this.connectAgent();
-    } catch (err) {
-      console.error("[KIMI] Mic error:", err);
-      this.callbacks.onError("Microphone access denied or unavailable.");
+      this.callbacks.onStateChange("listening");
+      console.log("[KIMI] Connected to LiveKit room");
+    } catch (err: any) {
+      console.error("[KIMI] Start error:", err);
+      this.callbacks.onError(err?.message || "Failed to connect");
       this.stop();
     }
+  }
+
+  private setupRoomEvents() {
+    if (!this.room) return;
+
+    this.room.on(
+      RoomEvent.TrackSubscribed,
+      (track: RemoteTrack, _pub: RemoteTrackPublication, participant: RemoteParticipant) => {
+        if (track.kind === Track.Kind.Audio) {
+          const el = track.attach();
+          el.id = `lk-audio-${participant.identity}`;
+          document.body.appendChild(el);
+          this.callbacks.onStateChange("speaking");
+        }
+      }
+    );
+
+    this.room.on(RoomEvent.TrackUnsubscribed, (track: RemoteTrack) => {
+      track.detach().forEach((el) => el.remove());
+    });
+
+    this.room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+      if (!this.isRunning) return;
+      const agentSpeaking = speakers.some((s) => !s.isLocal);
+      if (agentSpeaking) {
+        this.callbacks.onStateChange("speaking");
+      } else {
+        this.callbacks.onStateChange("listening");
+      }
+    });
+
+    this.room.on(RoomEvent.DataReceived, (payload, participant) => {
+      if (!participant || participant.isLocal) return;
+      try {
+        const msg = JSON.parse(new TextDecoder().decode(payload));
+        if (msg.text) {
+          this.callbacks.onFinalTranscript({
+            role: "assistant",
+            text: msg.text,
+            timestamp: new Date(),
+          });
+        }
+      } catch {
+        // not JSON data
+      }
+    });
+
+    // LiveKit Agents transcription events
+    this.room.on(RoomEvent.TranscriptionReceived as any, (segments: any[], participant: any) => {
+      for (const seg of segments) {
+        if (seg.final) {
+          this.callbacks.onInterimTranscript("");
+          this.callbacks.onFinalTranscript({
+            role: participant?.isLocal ? "user" : "assistant",
+            text: seg.text,
+            timestamp: new Date(),
+          });
+        } else {
+          this.callbacks.onInterimTranscript(seg.text);
+        }
+      }
+    });
+
+    this.room.on(RoomEvent.Disconnected, () => {
+      if (this.isRunning) {
+        this.callbacks.onError("Disconnected from room");
+        this.stop();
+      }
+    });
+
+    this.room.on(RoomEvent.ParticipantConnected, (participant) => {
+      console.log("[KIMI] Agent joined:", participant.identity);
+    });
+  }
+
+  private setupAudioMonitoring() {
+    const pub = this.room?.localParticipant?.getTrackPublication(Track.Source.Microphone);
+    const mediaTrack = pub?.track?.mediaStreamTrack;
+
+    if (mediaTrack) {
+      this.audioContext = new AudioContext();
+      const stream = new MediaStream([mediaTrack]);
+      const source = this.audioContext.createMediaStreamSource(stream);
+      this.analyser = this.audioContext.createAnalyser();
+      this.analyser.fftSize = 256;
+      source.connect(this.analyser);
+      this.monitorAudio();
+      return;
+    }
+
+    // Fallback: use LiveKit's built-in audio levels
+    this.monitorParticipantLevels();
   }
 
   private monitorAudio() {
@@ -133,279 +194,25 @@ export class VoicePipeline {
 
       this.animationFrame = requestAnimationFrame(tick);
     };
-
     tick();
   }
 
-  private connectAgent() {
-    if (!this.isRunning || !DEEPGRAM_KEY) return;
+  private monitorParticipantLevels() {
+    const tick = () => {
+      if (!this.isRunning || !this.room) return;
+      const level = this.room.localParticipant?.audioLevel || 0;
+      this.callbacks.onAudioLevel(level);
 
-    console.log("[KIMI Agent] Connecting to Deepgram Voice Agent...");
+      const waveform: number[] = [];
+      for (let i = 0; i < 64; i++) {
+        const noise = (Math.random() - 0.5) * 0.1;
+        waveform.push(level * Math.sin(i * 0.3 + Date.now() * 0.01) + noise * level);
+      }
+      this.callbacks.onWaveformData(waveform);
 
-    const url = "wss://agent.deepgram.com/v1/agent/converse";
-    this.socket = new WebSocket(url, ["token", DEEPGRAM_KEY]);
-    this.socket.binaryType = "arraybuffer";
-
-    this.socket.onopen = () => {
-      console.log("[KIMI Agent] WebSocket open, sending settings...");
-
-      const settings = {
-        type: "Settings",
-        audio: {
-          input: {
-            encoding: "linear16",
-            sample_rate: 16000,
-          },
-          output: {
-            encoding: "linear16",
-            sample_rate: 24000,
-            container: "none",
-          },
-        },
-        agent: {
-          listen: {
-            provider: {
-              type: "deepgram",
-              model: "nova-3",
-            },
-          },
-          think: {
-            provider: { type: "open_ai", model: "gpt-4o-mini" },
-            instructions:
-              "You are KIMI, a cutting-edge AI voice assistant. Be concise, natural, and helpful. Keep each response short and clear.",
-          },
-          speak: {
-            provider: {
-              type: "deepgram",
-              model: "aura-asteria-en",
-            },
-          },
-          greeting: "Hello, I am KIMI. How can I help you?",
-        },
-      };
-
-      this.socket?.send(JSON.stringify(settings));
+      this.animationFrame = requestAnimationFrame(tick);
     };
-
-    this.socket.onmessage = (event) => {
-      if (event.data instanceof ArrayBuffer) {
-        this.handleAudioChunk(new Int16Array(event.data));
-        return;
-      }
-
-      if (event.data instanceof Blob) {
-        void this.handleAudioBlob(event.data);
-        return;
-      }
-
-      try {
-        const msg = JSON.parse(event.data as string);
-        this.handleAgentMessage(msg);
-      } catch (err) {
-        console.error("[KIMI Agent] Parse error:", err);
-      }
-    };
-
-    this.socket.onerror = (err) => {
-      console.error("[KIMI Agent] WebSocket error:", err);
-      this.callbacks.onError("Voice agent connection error.");
-    };
-
-    this.socket.onclose = (event) => {
-      console.log("[KIMI Agent] Closed:", event.code, event.reason);
-      if (this.isRunning && this.reconnectAttempts < this.MAX_RECONNECTS) {
-        this.reconnectAttempts++;
-        console.log(
-          `[KIMI Agent] Reconnecting (${this.reconnectAttempts}/${this.MAX_RECONNECTS}) in 1s...`,
-        );
-        setTimeout(() => this.connectAgent(), 1000);
-      } else if (this.reconnectAttempts >= this.MAX_RECONNECTS) {
-        console.error("[KIMI Agent] Max reconnects reached, stopping.");
-        this.callbacks.onError("Connection lost. Please restart the call.");
-        this.stop();
-      }
-    };
-  }
-
-  private handleAgentMessage(msg: any) {
-    const type = msg.type;
-
-    switch (type) {
-      case "Welcome":
-        console.log("[KIMI Agent] Welcome received");
-        break;
-
-      case "SettingsApplied":
-        console.log("[KIMI Agent] Settings applied");
-        this.reconnectAttempts = 0;
-        this.callbacks.onStateChange("listening");
-        break;
-
-      case "UserStartedSpeaking":
-        this.interruptPlayback();
-        this.callbacks.onStateChange("listening");
-        break;
-
-      case "UserTranscript":
-      case "Transcript":
-      case "ConversationText":
-        this.handleTranscriptMessage(msg);
-        break;
-
-      case "UserTranscriptInterim":
-      case "TranscriptInterim": {
-        const interim = this.extractText(msg);
-        if (interim) {
-          this.callbacks.onInterimTranscript(interim);
-          this.callbacks.onStateChange("listening");
-        }
-        break;
-      }
-
-      case "AgentThinking":
-        this.callbacks.onStateChange("thinking");
-        break;
-
-      case "AgentStartedSpeaking":
-        this.callbacks.onStateChange("speaking");
-        break;
-
-      case "AgentAudioDone":
-        this.flushAudioBuffer();
-        break;
-
-      case "Error":
-        this.callbacks.onError(msg.description || msg.message || "Voice agent error.");
-        break;
-
-      default:
-        console.log("[KIMI Agent] Event:", type, msg);
-    }
-  }
-
-  private handleTranscriptMessage(msg: any) {
-    const text = this.extractText(msg);
-    if (!text) return;
-
-    const isInterim = Boolean(msg.is_interim || msg.interim);
-    if (isInterim) {
-      this.callbacks.onInterimTranscript(text);
-      return;
-    }
-
-    this.callbacks.onInterimTranscript("");
-
-    const roleRaw = (msg.role || msg.speaker || "assistant") as string;
-    const role: "user" | "assistant" = roleRaw === "user" ? "user" : "assistant";
-
-    this.callbacks.onFinalTranscript({
-      role,
-      text,
-      timestamp: new Date(),
-    });
-  }
-
-  private extractText(msg: any): string {
-    const candidates = [
-      msg?.content,
-      msg?.text,
-      msg?.transcript,
-      msg?.message,
-      msg?.delta,
-      msg?.channel?.alternatives?.[0]?.transcript,
-    ];
-
-    const found = candidates.find((v) => typeof v === "string" && v.trim().length > 0);
-    return (found || "").trim();
-  }
-
-  private async handleAudioBlob(blob: Blob) {
-    const arrayBuffer = await blob.arrayBuffer();
-    this.handleAudioChunk(new Int16Array(arrayBuffer));
-  }
-
-  private handleAudioChunk(int16: Int16Array) {
-    if (!int16.length) return;
-
-    this.pendingAudioChunks.push(int16);
-    this.pendingSamples += int16.length;
-
-    if (this.pendingSamples >= this.BUFFER_SIZE) {
-      this.flushAudioBuffer();
-    }
-  }
-
-  private flushAudioBuffer() {
-    if (!this.playbackContext || this.pendingAudioChunks.length === 0) return;
-
-    const totalLength = this.pendingAudioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const combined = new Int16Array(totalLength);
-    let offset = 0;
-
-    for (const chunk of this.pendingAudioChunks) {
-      combined.set(chunk, offset);
-      offset += chunk.length;
-    }
-
-    this.pendingAudioChunks = [];
-    this.pendingSamples = 0;
-
-    const float32 = new Float32Array(combined.length);
-    for (let i = 0; i < combined.length; i++) {
-      float32[i] = combined[i] / 32768;
-    }
-
-    const audioBuffer = this.playbackContext.createBuffer(1, float32.length, 24000);
-    audioBuffer.getChannelData(0).set(float32);
-
-    this.audioQueue.push(audioBuffer);
-
-    if (!this.isPlaying) {
-      this.playNextBuffer();
-    }
-  }
-
-  private playNextBuffer() {
-    if (!this.playbackContext || this.audioQueue.length === 0) {
-      this.isPlaying = false;
-      if (this.isRunning) this.callbacks.onStateChange("listening");
-      return;
-    }
-
-    this.isPlaying = true;
-    const buffer = this.audioQueue.shift();
-    if (!buffer) {
-      this.isPlaying = false;
-      return;
-    }
-
-    const source = this.playbackContext.createBufferSource();
-    source.buffer = buffer;
-    source.connect(this.playbackContext.destination);
-    this.currentSource = source;
-
-    source.onended = () => {
-      this.currentSource = null;
-      this.playNextBuffer();
-    };
-
-    source.start();
-  }
-
-  private interruptPlayback() {
-    if (this.currentSource) {
-      try {
-        this.currentSource.stop();
-      } catch (_) {
-        // no-op
-      }
-      this.currentSource = null;
-    }
-
-    this.audioQueue = [];
-    this.pendingAudioChunks = [];
-    this.pendingSamples = 0;
-    this.isPlaying = false;
+    tick();
   }
 
   stop() {
@@ -416,33 +223,9 @@ export class VoicePipeline {
       this.animationFrame = null;
     }
 
-    this.interruptPlayback();
-
-    if (this.scriptProcessor) {
-      this.scriptProcessor.disconnect();
-      this.scriptProcessor = null;
-    }
-
-    if (this.silentGainNode) {
-      this.silentGainNode.disconnect();
-      this.silentGainNode = null;
-    }
-
-    if (this.sourceNode) {
-      this.sourceNode.disconnect();
-      this.sourceNode = null;
-    }
-
-    if (this.socket) {
-      if (this.socket.readyState === WebSocket.OPEN) {
-        this.socket.close();
-      }
-      this.socket = null;
-    }
-
-    if (this.mediaStream) {
-      this.mediaStream.getTracks().forEach((t) => t.stop());
-      this.mediaStream = null;
+    if (this.room) {
+      this.room.disconnect();
+      this.room = null;
     }
 
     if (this.audioContext) {
@@ -450,10 +233,10 @@ export class VoicePipeline {
       this.audioContext = null;
     }
 
-    if (this.playbackContext) {
-      void this.playbackContext.close();
-      this.playbackContext = null;
-    }
+    this.analyser = null;
+
+    // Clean up attached audio elements
+    document.querySelectorAll("[id^='lk-audio-']").forEach((el) => el.remove());
 
     this.callbacks.onInterimTranscript("");
     this.callbacks.onStateChange("idle");
